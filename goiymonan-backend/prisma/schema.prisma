@@ -1,0 +1,173 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+//
+// ======================
+// BẢNG NGƯỜI DÙNG
+// ======================
+model User {
+  user_id    Int      @id @default(autoincrement()) // Khóa chính
+  username   String   @unique // Tên đăng nhập duy nhất
+  email      String   @unique // Email duy nhất
+  password   String // Mật khẩu (hash)
+  created_at DateTime @default(now()) // Thời điểm tạo
+
+  // QUAN HỆ
+  recipes Recipe[] // Một user có thể viết nhiều recipe
+  states  State[] // Một user có thể tạo nhiều state
+  reviews Review[] // Một user có nhiều đánh giá (Review)
+  rewards Reward[] // Một user có nhiều Reward
+}
+
+//
+// ======================
+// BẢNG CÔNG THỨC NẤU ĂN
+// ======================
+model Recipe {
+  recipe_id    Int      @id @default(autoincrement()) // Khóa chính
+  name         String // Tên món ăn
+  description  String? // Mô tả ngắn
+  instructions String? // Cách nấu
+  created_at   DateTime @default(now()) // Thời điểm tạo
+
+  // QUAN HỆ
+  author    User? @relation(fields: [author_id], references: [user_id]) // Tác giả
+  author_id Int?
+
+  ingredients RecipeOnIngredient[] // Quan hệ N-N với Ingredient
+  actions     Action[] // Action liên quan đến Recipe
+  reviews     Review[] // Review cho recipe
+}
+
+//
+// ======================
+// BẢNG NGUYÊN LIỆU
+// ======================
+model Ingredient {
+  ingredient_id Int     @id @default(autoincrement()) // Khóa chính
+  name          String // Tên nguyên liệu
+  unit          String? // Đơn vị (vd: gram, ml, cái)
+
+  recipes RecipeOnIngredient[] // Quan hệ N-N với Recipe
+}
+
+//
+// ======================
+// BẢNG TRUNG GIAN: Recipe <-> Ingredient
+// ======================
+model RecipeOnIngredient {
+  recipe_id     Int
+  ingredient_id Int
+  quantity      Float? // Số lượng nguyên liệu trong recipe
+
+  // QUAN HỆ
+  recipe     Recipe     @relation(fields: [recipe_id], references: [recipe_id])
+  ingredient Ingredient @relation(fields: [ingredient_id], references: [ingredient_id])
+
+  @@id([recipe_id, ingredient_id]) // Khóa chính kép
+}
+
+//
+// ======================
+// BẢNG HÀNH ĐỘNG (Action)
+// ======================
+// Action mô tả một hành động (chọn 1 recipe để cook, like/dislike,...)
+model Action {
+  action_id   Int     @id @default(autoincrement())
+  description String? // Mô tả hành động
+  recipe_id   Int? // Action liên quan đến Recipe nào
+
+  // QUAN HỆ
+  recipe Recipe?  @relation(fields: [recipe_id], references: [recipe_id])
+  qTable QTable[] // Một action có nhiều Q-Value (ứng với state khác nhau)
+  Reward Reward[] // Nhiều reward có thể gắn với action này
+}
+
+//
+// ======================
+// BẢNG TRẠNG THÁI (State)
+// ======================
+// State mô tả trạng thái tại thời điểm người dùng đưa ra hành động
+// Ví dụ: nguyên liệu đang có, bối cảnh sử dụng...
+model State {
+  state_id              Int      @id @default(autoincrement())
+  available_ingredients Json? // Nguyên liệu hiện có (mảng string JSON)
+  context               Json? // Ngữ cảnh (vd: actionType, giờ ăn, user info)
+  created_at            DateTime @default(now())
+
+  // QUAN HỆ
+  user    User? @relation(fields: [user_id], references: [user_id])
+  user_id Int?
+
+  qTable  QTable[] // Nhiều Q-value gắn với State này
+  rewards Reward[] // Nhiều Reward gắn với State này
+}
+
+//
+// ======================
+// BẢNG Q-TABLE
+// ======================
+// Lưu giá trị Q(state, action) cho RL agent.
+// Một cặp (state_id, action_id) chỉ có 1 giá trị Q.
+model QTable {
+  q_id       Int      @id @default(autoincrement())
+  q_value    Float    @default(0) // Giá trị Q
+  updated_at DateTime @default(now())
+
+  state_id  Int
+  action_id Int
+
+  // QUAN HỆ
+  state  State  @relation(fields: [state_id], references: [state_id])
+  action Action @relation(fields: [action_id], references: [action_id])
+
+  @@unique([state_id, action_id]) // Không cho phép trùng state-action
+}
+
+//
+// ======================
+// BẢNG REVIEW
+// ======================
+// Người dùng có thể review (đánh giá) recipe
+model Review {
+  review_id  Int      @id @default(autoincrement())
+  rating     Int // Điểm số (1-5)
+  comment    String? // Nội dung review
+  created_at DateTime @default(now())
+
+  user_id   Int
+  recipe_id Int
+
+  // QUAN HỆ
+  user   User   @relation(fields: [user_id], references: [user_id])
+  recipe Recipe @relation(fields: [recipe_id], references: [recipe_id])
+
+  @@unique([user_id, recipe_id]) // 1 user chỉ review 1 recipe 1 lần
+}
+
+//
+// ======================
+// BẢNG REWARD
+// ======================
+// Reward lưu lại giá trị thưởng/phạt khi user thực hiện 1 hành động trong 1 state.
+model Reward {
+  reward_id    Int      @id @default(autoincrement())
+  reward_value Float? // Giá trị thưởng/phạt (+/-)
+  created_at   DateTime @default(now())
+
+  state_id  Int
+  action_id Int
+  user_id   Int
+
+  // QUAN HỆ
+  state  State  @relation(fields: [state_id], references: [state_id])
+  action Action @relation(fields: [action_id], references: [action_id])
+  user   User   @relation(fields: [user_id], references: [user_id])
+}
