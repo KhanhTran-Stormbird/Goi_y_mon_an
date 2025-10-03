@@ -3,7 +3,7 @@
   "info": {
     "title": "Gợi Ý Món Ăn API",
     "version": "1.0.0",
-    "description": "# Tổng quan\n\nMôi trường backend là gym RL cho bài toán gợi ý món ăn, với seed cố định: 1 user mặc định · 10 recipe phổ biến · 15 nguyên liệu cơ bản. Reward = tỉ lệ khớp nguyên liệu + bonus rating seed + phản hồi thực tế. Tài liệu này nhằm cung cấp đầy đủ context để ChatGPT/Gemini sinh script huấn luyện Q-Learning, SARSA, DQN, Multi-Armed Bandit trên bộ API này.\n\n---\n\n## Kiến trúc nhanh\n- Backend (Node 18, Express, Prisma, Redis)\n  - Routes chính: POST /env/reset, POST /env/step, POST /recommendations, POST /feedback, GET /recipes, GET /recipes/{id}.\n  - Dữ liệu: Postgres với các bảng User, Recipe, Ingredient, RecipeOnIngredient, State, Action, Reward, Review, QTable.\n  - Seeder tạo user default_user, 15 nguyên liệu, 10 recipe. Có thể bật RL-service mẫu (FastAPI trong rl/q-learning, http://localhost:8000) qua biến RL_BASE.\n- Frontend (Next.js 15, axios)\n  - Trang / nhận nguyên liệu, gọi reset + recommend.\n  - Trang /recommend hiển thị món, tự gọi /env/step, gửi feedback, điều hướng /recipe/{id} khi like.\n\n---\n\n## Vòng đời episode (chuẩn)\n1. Reset: POST /env/reset với nguyên liệu hiện có. Trả về state_id, pantry chuẩn hóa, context.history = [], meal_time được suy luận theo giờ ( <08h: “Ăn sáng”, 08–15h: “Ăn trưa”, còn lại: “Ăn tối”). Có thể override meal_time.\n2. Encode state: chuyển pantry + context về vector (one-hot nguyên liệu, one-hot meal_time, history rút gọn...).\n3. Chọn action: thuật toán trả recipe_id (1..10 xem từ GET /recipes).\n4. Step: POST /env/step với state_id hiện tại và action_id. Nhận reward ∈ [0,1], details.match_ratio, details.rating_bonus, matched/missing ingredients, next_state (state_id mới) và done.\n5. Cập nhật: lưu (s, a, r, s', done) vào Q-table/replay buffer/bộ đếm tùy thuật toán.\n6. Lặp: nếu done = true hoặc đạt max step → Reset; ngược lại dùng next_state.state_id tiếp tục.\n7. Feedback thực (optional): POST /feedback khi người dùng like/dislike. Backend chuẩn hóa choose → like, phạt nếu spam (>2 lần/giờ) và forward reward sang RL-service nếu có.\n\n---\n\n## Endpoint cheat sheet (copy cho LLM)\n- POST /env/reset\n  - Request: { \"available_ingredients\": [\"Trứng gà\", \"Dầu ăn\"], \"context\": { \"note\": \"ăn sáng\" } }\n  - Response: { \"state_id\": 1, \"available_ingredients\": [\"trứng gà\", \"dầu ăn\"], \"context\": { \"note\": \"ăn sáng\", \"meal_time\": \"Ăn sáng\", \"history\": [] } }\n- POST /env/step\n  - Request: { \"state_id\": 1, \"action_id\": 2 }\n  - Response: { \"reward\": 0.86, \"details\": { \"match_ratio\": 0.8, \"rating_bonus\": 0.06, ... }, \"matched_ingredients\": [...], \"missing_ingredients\": [...], \"next_state\": { \"state_id\": 2, ... , \"done\": false } }\n- POST /recommendations\n  - Request: { \"state\": { \"avail\": [\"trứng gà\", \"dầu ăn\"], \"history\": [] }, \"k\": 6 }\n  - Response: { \"chosen\": { ...recipe detail... }, \"epsilon\": 0.42, \"message\": \"Fallback recommendation (RL service offline)\" }\n- POST /feedback\n  - Request: { \"recipeId\": 2, \"actionType\": \"like\", \"userId\": 1, \"state\": { \"avail\": [\"trứng gà\"], \"history\": [...] } }\n  - Response: { \"success\": true, \"reward\": 15, \"details\": { \"match>=70%\": 10, \"action:like\": 5 }, \"repeats\": 1, \"next_state\": {...} }\n- GET /recipes\n  - Response: { \"total\": 10, \"recipes\": [ { \"recipe_id\": 1, \"name\": \"Phở bò\", \"ingredients\": [...] }, ... ] }\n\n---\n\n## Encode state & reward – lưu ý\n- available_ingredients: giữ nguyên để hiển thị, nhưng luôn lower-case khi so khớp/encode.\n- context.history: mỗi phần tử { recipe_id, name, reward, match_ratio, at }; encode bằng window 5–10 phần tử gần nhất.\n- Reward /env/step = match_ratio + rating_bonus (≤1, rating_bonus = (average_rating / 5) * 0.2).\n- Reward /feedback: +10 nếu match ≥70 %, +5 nếu like, -5 nếu dislike, -5 nếu thiếu nguyên liệu quan trọng, -10 nếu spam.\n- simulateNextPantry trừ nguyên liệu đã dùng; nếu pantry rỗng → done = true và giữ lại nguyên liệu đầu tiên của trạng thái trước.\n\n---\n\n## Frontend flow\n- Trang /\n  1. Người dùng nhập nguyên liệu (chuỗi comma).\n  2. Tự tính mealTime theo giờ máy (<8h: “Ăn sáng”; <16h: “Ăn trưa”; còn lại “Ăn tối”).\n  3. POST /env/reset → lấy stateId, stateContext.\n  4. POST /recommendations (k = 6) → lấy chosen.\n  5. Lưu ingredients, stateId, stateContext, currentRec vào sessionStorage → chuyển /recommend.\n- Trang /recommend\n  1. Đọc sessionStorage để khởi tạo state.\n  2. Effect advanceEnvironment gọi POST /env/step cho currentRec → cập nhật pantry, history, reward, stateId mới.\n  3. Nút dislike → POST /feedback (actionType = \"dislike\") → gọi lại /recommendations.\n  4. Nút like → POST /feedback (actionType = \"like\") → điều hướng /recipe/{id}.\n\n---\n\n## Chiến lược thuật toán\n- Q-Learning: hash state = sorted(avail) + meal_time + fingerprint history. epsilon-greedy (eps_start=1.0 → eps_end=0.1, decay=0.995). Cập nhật Q[s,a] = (1-α)Q[s,a] + α(r + γ·max_a' Q[s',a']) (nếu done thì target = r). Log reward trung bình/episode, epsilon, top-3 action.\n- SARSA: cập nhật on-policy Q[s,a] += α(r + γ·Q[s',a_next] - Q[s,a]). Phải lưu a_next trước khi gọi /env/step kế. Giảm rủi ro chọn món thiếu nguyên liệu quan trọng.\n- DQN: state vector = [15 one-hot ingredient, 3 one-hot meal_time, 5*(recipe_id/10, reward)]. Model gợi ý: Dense(128) → Dense(128) → Dense(64) → Dense(10). Replay buffer ≥10k, batch 64, target update mỗi 200 step, Adam lr=1e-3, epsilon decay. Prompt LLM yêu cầu code axios/fetch + replay buffer.\n- Multi-Armed Bandit: mỗi recipe_id là 1 arm, reward = /env/step trả về. Dùng epsilon-greedy (ε=0.1), UCB1 (avg + sqrt(2 ln t / pulls)) hoặc Thompson. Khi done=true nhớ reset để pantry không cạn. Theo dõi ranking món.\n\n---\n\n## Checklist bàn giao\n- Script train cho cả 4 thuật toán (tham số cấu hình rõ ràng: α, γ, ε, batch_size, buffer_size...).\n- Ghi log/CSV: episode, avg_reward, match_ratio, epsilon hoặc loss (DQN).\n- Đồ thị so sánh tốc độ hội tụ giữa các thuật toán.\n- Demo: nhập nguyên liệu trên frontend → xem agent đề xuất → reward card hiện từ /env/step.\n- Khi nhờ ChatGPT/Gemini: đính kèm toàn bộ cheat sheet này + yêu cầu cụ thể (ví dụ “viết DQN bằng Python dùng requests thư viện”).\n- Debug nhanh: HTTP 400 (thiếu state_id hoặc action_id), 404 (recipe_id không có trong seed), 500 (DB/Redis/RL-service chưa sẵn sàng).\n\nChúc team triển khai trơn tru!"
+    "description": "# Tổng quan\n\nMôi trường backend là gym RL cho bài toán gợi ý món ăn, với seed cố định: 1 user mặc định · 10 recipe phổ biến · 15 nguyên liệu cơ bản. Reward = tỉ lệ khớp nguyên liệu + bonus rating seed + phản hồi thực tế. Tài liệu này nhằm cung cấp đầy đủ context để ChatGPT/Gemini sinh script huấn luyện Q-Learning, SARSA, DQN, Multi-Armed Bandit trên bộ API này.\n\n---\n\n## Kiến trúc nhanh\n- Backend (Node 18, Express, Prisma, Redis)\n  - Routes chính: POST /env/reset, POST /env/step, POST /recommendations, POST /feedback, GET /recipes, GET /recipes/{id}.\n  - Dữ liệu: Postgres với các bảng User, Recipe, Ingredient, RecipeOnIngredient, State, Action, Reward, Review, QTable.\n  - Seeder tạo user default_user, 15 nguyên liệu, 10 recipe. Có thể bật RL-service mẫu (FastAPI trong rl/q-learning, http://localhost:8000) qua biến RL_BASE.\n- Frontend (Next.js 15, axios)\n  - Trang / nhận nguyên liệu, gọi reset + recommend.\n  - Trang /recommend hiển thị món, tự gọi /env/step, gửi feedback, điều hướng /recipe/{id} khi like.\n\n---\n\n## Vòng đời episode (chuẩn)\n1. Reset: POST /env/reset với nguyên liệu hiện có. Trả về state_id, pantry chuẩn hóa, context.history = [], meal_time được suy luận theo giờ ( <08h: “Ăn sáng”, 08–15h: “Ăn trưa”, còn lại: “Ăn tối”). Có thể override meal_time.\n2. Encode state: chuyển pantry + context về vector (one-hot nguyên liệu, one-hot meal_time, history rút gọn...).\n3. Chọn action: thuật toán trả recipe_id (1..10 xem từ GET /recipes).\n4. Step: POST /env/step với state_id hiện tại và action_id. Nhận reward ∈ [0,1], details.match_ratio, details.rating_bonus, matched/missing ingredients, next_state (state_id mới) và done.\n5. Cập nhật: lưu (s, a, r, s', done) vào Q-table/replay buffer/bộ đếm tùy thuật toán.\n6. Lặp: nếu done = true hoặc đạt max step → Reset; ngược lại dùng next_state.state_id tiếp tục.\n7. Feedback thực (optional): POST /feedback khi người dùng like/dislike. Backend chuẩn hóa choose → like, phạt nếu spam (>2 lần/giờ) và forward reward sang RL-service nếu có.\n\n---\n\n## Endpoint cheat sheet (copy cho LLM)\n- POST /env/reset\n  - Request: { \"available_ingredients\": [\"Trứng gà\", \"Dầu ăn\"], \"context\": { \"meal_time\": \"ăn sáng\" } }\n  - Response: { \"state_id\": 1, \"available_ingredients\": [\"trứng gà\", \"dầu ăn\"], \"context\": { \"meal_time\": \"ăn sáng\", \"meal_time\": \"Ăn sáng\", \"history\": [] } }\n- POST /env/step\n  - Request: { \"state_id\": 1, \"action_id\": 2 }\n  - Response: { \"reward\": 0.86, \"details\": { \"match_ratio\": 0.8, \"rating_bonus\": 0.06, ... }, \"matched_ingredients\": [...], \"missing_ingredients\": [...], \"next_state\": { \"state_id\": 2, ... , \"done\": false } }\n- POST /recommendations\n  - Request: { \"state\": { \"avail\": [\"trứng gà\", \"dầu ăn\"], \"history\": [] }, \"k\": 6 }\n  - Response: { \"chosen\": { ...recipe detail... }, \"epsilon\": 0.42, \"message\": \"Fallback recommendation (RL service offline)\" }\n- POST /feedback\n  - Request: { \"recipeId\": 2, \"actionType\": \"like\", \"userId\": 1, \"state\": { \"avail\": [\"trứng gà\"], \"history\": [...] } }\n  - Response: { \"success\": true, \"reward\": 15, \"details\": { \"match>=70%\": 10, \"action:like\": 5 }, \"repeats\": 1, \"next_state\": {...} }\n- GET /recipes\n  - Response: { \"total\": 10, \"recipes\": [ { \"recipe_id\": 1, \"name\": \"Phở bò\", \"ingredients\": [...] }, ... ] }\n\n---\n\n## Encode state & reward – lưu ý\n- available_ingredients: giữ nguyên để hiển thị, nhưng luôn lower-case khi so khớp/encode.\n- context.history: mỗi phần tử { recipe_id, name, reward, match_ratio, at }; encode bằng window 5–10 phần tử gần nhất.\n- Reward /env/step = match_ratio + rating_bonus (≤1, rating_bonus = (average_rating / 5) * 0.2).\n- Reward /feedback: +10 nếu match ≥70 %, +5 nếu like, -5 nếu dislike, -5 nếu thiếu nguyên liệu quan trọng, -10 nếu spam.\n- simulateNextPantry trừ nguyên liệu đã dùng; nếu pantry rỗng → done = true và giữ lại nguyên liệu đầu tiên của trạng thái trước.\n\n---\n\n## Frontend flow\n- Trang /\n  1. Người dùng nhập nguyên liệu (chuỗi comma).\n  2. Tự tính mealTime theo giờ máy (<8h: “Ăn sáng”; <16h: “Ăn trưa”; còn lại “Ăn tối”).\n  3. POST /env/reset → lấy stateId, stateContext.\n  4. POST /recommendations (k = 6) → lấy chosen.\n  5. Lưu ingredients, stateId, stateContext, currentRec vào sessionStorage → chuyển /recommend.\n- Trang /recommend\n  1. Đọc sessionStorage để khởi tạo state.\n  2. Effect advanceEnvironment gọi POST /env/step cho currentRec → cập nhật pantry, history, reward, stateId mới.\n  3. Nút dislike → POST /feedback (actionType = \"dislike\") → gọi lại /recommendations.\n  4. Nút like → POST /feedback (actionType = \"like\") → điều hướng /recipe/{id}.\n\n---\n\n## Chiến lược thuật toán\n- Q-Learning: hash state = sorted(avail) + meal_time + fingerprint history. epsilon-greedy (eps_start=1.0 → eps_end=0.1, decay=0.995). Cập nhật Q[s,a] = (1-α)Q[s,a] + α(r + γ·max_a' Q[s',a']) (nếu done thì target = r). Log reward trung bình/episode, epsilon, top-3 action.\n- SARSA: cập nhật on-policy Q[s,a] += α(r + γ·Q[s',a_next] - Q[s,a]). Phải lưu a_next trước khi gọi /env/step kế. Giảm rủi ro chọn món thiếu nguyên liệu quan trọng.\n- DQN: state vector = [15 one-hot ingredient, 3 one-hot meal_time, 5*(recipe_id/10, reward)]. Model gợi ý: Dense(128) → Dense(128) → Dense(64) → Dense(10). Replay buffer ≥10k, batch 64, target update mỗi 200 step, Adam lr=1e-3, epsilon decay. Prompt LLM yêu cầu code axios/fetch + replay buffer.\n- Multi-Armed Bandit: mỗi recipe_id là 1 arm, reward = /env/step trả về. Dùng epsilon-greedy (ε=0.1), UCB1 (avg + sqrt(2 ln t / pulls)) hoặc Thompson. Khi done=true nhớ reset để pantry không cạn. Theo dõi ranking món.\n\n---\n\n## Checklist bàn giao\n- Script train cho cả 4 thuật toán (tham số cấu hình rõ ràng: α, γ, ε, batch_size, buffer_size...).\n- Ghi log/CSV: episode, avg_reward, match_ratio, epsilon hoặc loss (DQN).\n- Đồ thị so sánh tốc độ hội tụ giữa các thuật toán.\n- Demo: nhập nguyên liệu trên frontend → xem agent đề xuất → reward card hiện từ /env/step.\n- Khi nhờ ChatGPT/Gemini: đính kèm toàn bộ cheat sheet này + yêu cầu cụ thể (ví dụ “viết DQN bằng Python dùng requests thư viện”).\n- Debug nhanh: HTTP 400 (thiếu state_id hoặc action_id), 404 (recipe_id không có trong seed), 500 (DB/Redis/RL-service chưa sẵn sàng).\n\nChúc team triển khai trơn tru!"
   },
   "servers": [
     {
@@ -32,9 +32,7 @@
   "paths": {
     "/env/reset": {
       "post": {
-        "tags": [
-          "Environment"
-        ],
+        "tags": ["Environment"],
         "summary": "Khởi tạo trạng thái môi trường",
         "description": "Tạo state mới cho episode dựa trên nguyên liệu người dùng nhập.",
         "requestBody": {
@@ -45,10 +43,7 @@
                 "": "#/components/schemas/EnvResetRequest"
               },
               "example": {
-                "available_ingredients": [
-                  "Trứng gà",
-                  "Dầu ăn"
-                ],
+                "available_ingredients": ["Trứng gà", "Dầu ăn"],
                 "context": {
                   "meal_time": "breakfast"
                 }
@@ -78,9 +73,7 @@
     },
     "/env/step": {
       "post": {
-        "tags": [
-          "Environment"
-        ],
+        "tags": ["Environment"],
         "summary": "Thực hiện một hành động trong môi trường",
         "description": "Trả reward, thông tin match và state kế tiếp sau khi chọn một công thức.",
         "requestBody": {
@@ -122,9 +115,7 @@
     },
     "/recommendations": {
       "post": {
-        "tags": [
-          "Recommendation"
-        ],
+        "tags": ["Recommendation"],
         "summary": "Lấy món gợi ý",
         "description": "Gửi state hiện tại sang RL service (nếu có) hoặc fallback theo tỉ lệ match.",
         "requestBody": {
@@ -136,10 +127,7 @@
               },
               "example": {
                 "state": {
-                  "avail": [
-                    "Trứng gà",
-                    "Dầu ăn"
-                  ],
+                  "avail": ["Trứng gà", "Dầu ăn"],
                   "history": []
                 },
                 "k": 5
@@ -166,9 +154,7 @@
     },
     "/feedback": {
       "post": {
-        "tags": [
-          "Feedback"
-        ],
+        "tags": ["Feedback"],
         "summary": "Ghi nhận like/dislike của người dùng",
         "description": "Lưu reward, cập nhật lịch sử và forward sang RL service (nếu cấu hình).",
         "requestBody": {
@@ -183,10 +169,7 @@
                 "actionType": "like",
                 "userId": 1,
                 "state": {
-                  "avail": [
-                    "Trứng gà",
-                    "Dầu ăn"
-                  ],
+                  "avail": ["Trứng gà", "Dầu ăn"],
                   "history": []
                 }
               }
@@ -215,9 +198,7 @@
     },
     "/recipes": {
       "get": {
-        "tags": [
-          "Recipes"
-        ],
+        "tags": ["Recipes"],
         "summary": "Danh sách công thức",
         "description": "Trả về tất cả công thức trong seed để agent xây dựng action space.",
         "responses": {
@@ -236,9 +217,7 @@
     },
     "/recipes/{id}": {
       "get": {
-        "tags": [
-          "Recipes"
-        ],
+        "tags": ["Recipes"],
         "summary": "Chi tiết một công thức",
         "parameters": [
           {
@@ -376,10 +355,7 @@
       },
       "EnvStepRequest": {
         "type": "object",
-        "required": [
-          "state_id",
-          "action_id"
-        ],
+        "required": ["state_id", "action_id"],
         "properties": {
           "state_id": {
             "type": "integer"
@@ -470,9 +446,7 @@
       },
       "RecommendationRequest": {
         "type": "object",
-        "required": [
-          "state"
-        ],
+        "required": ["state"],
         "properties": {
           "state": {
             "type": "object",
@@ -514,20 +488,14 @@
       },
       "FeedbackRequest": {
         "type": "object",
-        "required": [
-          "recipeId",
-          "actionType"
-        ],
+        "required": ["recipeId", "actionType"],
         "properties": {
           "recipeId": {
             "type": "integer"
           },
           "actionType": {
             "type": "string",
-            "enum": [
-              "like",
-              "dislike"
-            ]
+            "enum": ["like", "dislike"]
           },
           "userId": {
             "type": "integer",
