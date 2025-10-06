@@ -40,16 +40,16 @@ services:
       redis:
         condition: service_started
       # Khi muốn dùng thêm RL-Service vào docker thì uncomment cái này
-      # rl-service:
-      #   condition: service_started
+      rl-service:
+        condition: service_started
 
   # ví dụ cho server RL-service sử dụng docker
   # (Nếu muốn dùng với docker, còn ko thì cứ định nghĩa trong env để chạy riêng là được rồi)
-  # rl-service:
-  #   build: ./rl/q-learning  # thư mục chứa Dockerfile của rl-service
-  #   ports:
-  #     - "8000:8000"
-  #   restart: always
+  rl-service:
+    build: ./rl/sarsa # thư mục chứa Dockerfile của rl-service
+    ports:
+      - "8000:8000"
+    restart: always
 
 volumes:
   pgdata:
